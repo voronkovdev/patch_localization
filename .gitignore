@@ -1,0 +1,40 @@
+# Build directories and CMake files
+build/
+build*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+install_manifest.txt
+
+# IDE/editor
+.vs/
+.vscode/
+*.code-workspace
+
+# MSVC/compile artifacts
+*.obj
+*.o
+*.pch
+*.idb
+*.pdb
+*.ipdb
+*.iobj
+*.lib
+*.exp
+*.dll
+*.exe
+*.log
+
+# Project outputs
+output_dir/
+out*/
+*.pldb
+*.csv
+*.png
+run.log
+
+# Misc
+__pycache__/
+.DS_Store
+Thumbs.db
