@@ -1,26 +1,18 @@
-#include <opencv2/opencv.hpp>
+#include "patch_localization.h"
 #include <iostream>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <limits> // Для std::numeric_limits
-#include <cmath>  // Для std::hypot
-#include <algorithm> // Для std::max, std::min
+#include <limits>
+#include <cmath>
+#include <algorithm>
+#include <tuple>
 
 #ifdef _WIN32
 #include <windows.h>
 #endif
 
-#include "image_processor.h"
-#include "autoencoder.h"
-#include "localization.h"
-#include "index_io.h"
-
 namespace fs = std::filesystem;
-
-// Простой CLI:
-// patch_localization --big <путь_к_большому_изображению> --patch <путь_к_патчу> --out <выходная_папка>
-// или: patch_localization --demo --out <выходная_папка>
 
 // Генерирует демо-изображения для тестирования
 static void generateDemoImages(const std::filesystem::path& outDir,
@@ -95,13 +87,14 @@ int main(int argc, char** argv) {
     
     std::string bigPath;
     std::string patchPath;
-    std::string outDir = "output_dir";
+    std::string outDir = "output";
     bool demoMode = false;
     std::string evalCsv;
     int genPatchesN = 0;
     
-    // Новые аргументы для нейронной сети
+    // Аргументы для сверточного автоэнкодера
     bool trainMode = false;
+    bool rebuildIndex = false;
     std::string modelPath;
     int epochs = 100;
     float learningRate = 0.001f;
@@ -114,19 +107,16 @@ int main(int argc, char** argv) {
             std::cout << "Опции:\n";
             std::cout << "  --big <файл>           Путь к большому изображению\n";
             std::cout << "  --patch <файл>         Путь к патчу для поиска\n";
-            std::cout << "  --out <папка>          Выходная папка (по умолчанию: output_dir)\n";
+            std::cout << "  --out <папка>          Выходная папка (по умолчанию: output)\n";
             std::cout << "  --demo                 Демо-режим (генерирует тестовые изображения)\n";
             std::cout << "  --eval-csv <файл>      CSV файл для оценки\n";
             std::cout << "  --gen-patches <N>      Генерирует N патчей\n";
-            std::cout << "  --train                Режим обучения нейронной сети\n";
+            std::cout << "  --train                Режим обучения сверточного автоэнкодера\n";
+            std::cout << "  --rebuild-index        Принудительно пересоздать индекс\n";
             std::cout << "  --model <файл>         Путь к модели для загрузки/сохранения\n";
             std::cout << "  --epochs <число>       Количество эпох обучения (по умолчанию: 100)\n";
             std::cout << "  --lr <число>           Скорость обучения (по умолчанию: 0.001)\n";
             std::cout << "  --help, -h             Показать эту справку\n";
-            std::cout << "\nПримеры:\n";
-            std::cout << "  patch_localization --demo --out demo_output\n";
-            std::cout << "  patch_localization --train --big image.png --epochs 10 --lr 0.001\n";
-            std::cout << "  patch_localization --big image.png --patch patch.png --out result\n";
             return 0;
         }
         else if (a == "--big" && i + 1 < argc) bigPath = argv[++i];
@@ -138,8 +128,8 @@ int main(int argc, char** argv) {
             try { genPatchesN = std::stoi(argv[++i]); } 
             catch (...) { genPatchesN = 0; } 
         }
-        // Новые аргументы для обучения
         else if (a == "--train") trainMode = true;
+        else if (a == "--rebuild-index") rebuildIndex = true;
         else if (a == "--model" && i + 1 < argc) modelPath = argv[++i];
         else if (a == "--epochs" && i + 1 < argc) { 
             try { epochs = std::stoi(argv[++i]); } 
@@ -162,7 +152,7 @@ int main(int argc, char** argv) {
         } 
     };
     
-    logmsg("[INFO] patch_localization запускается...");
+    logmsg("[INFO] Система локализации патчей запускается...");
 
     // Демо-режим
     if (demoMode) {
@@ -170,11 +160,14 @@ int main(int argc, char** argv) {
         logmsg("[INFO] Демо-режим: генерируем изображения...");
         generateDemoImages(outDir, demoBig, demoPatch);
         bigPath = demoBig;
-        patchPath = demoPatch;
+        // Устанавливаем patchPath только если не указан eval-csv
+        if (evalCsv.empty()) {
+            patchPath = demoPatch;
+        }
     }
 
     // Проверяем аргументы
-    if (bigPath.empty() || (patchPath.empty() && evalCsv.empty() && genPatchesN == 0)) {
+    if (bigPath.empty() || (patchPath.empty() && evalCsv.empty() && genPatchesN == 0 && !trainMode)) {
         logmsg("[ERROR] Неверные аргументы.");
         std::cerr << "Использование: patch_localization --big <большое_изображение> --patch <патч> [--out выходная_папка]\n";
         std::cerr << "   или: patch_localization --demo [--out выходная_папка]\n";
@@ -196,50 +189,70 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-            // Вырезаем патчи согласно ТЗ: 200×200 пикселей с шагом 50
+    // Вырезаем патчи согласно ТЗ: 200×200 пикселей с шагом 50
     const int patchSize = 200; // согласно ТЗ: 200м × 200м
     const int step = 50;
     auto patches = ip.cutPatches(patchSize, step);
     logmsg("[INFO] Вырезано патчей: " + std::to_string(patches.size()));
 
-    // Создаем базу данных дескрипторов
-    Autoencoder enc;
+    // Создаем сверточный автоэнкодер
+    ConvolutionalAutoencoder convAE;
     
     // Загружаем обученную модель (если указана)
-    if (!modelPath.empty() && !trainMode) {
-        if (enc.loadModel(modelPath)) {
+    if (!modelPath.empty()) {
+        if (convAE.loadModel(modelPath)) {
             logmsg("[INFO] Загружена обученная модель: " + modelPath);
         } else {
-            logmsg("[WARN] Не удалось загрузить модель: " + modelPath + ", используем базовые гистограммы");
+            logmsg("[WARN] Не удалось загрузить модель: " + modelPath + ", будет создана новая");
         }
     }
     
     std::vector<IndexedDescriptor> db;
     
-    // Пробуем загрузить кэшированный индекс
-    std::string indexPath = (fs::path(outDir) / "index.pldb").string();
-    if (loadIndex(indexPath, db, 256)) {
+    // Индекс зависит от имени файла большого изображения и времени его изменения
+    std::string indexPath;
+    try {
+        auto ft = fs::last_write_time(bigPath);
+        uint64_t mtimeTicks = static_cast<uint64_t>(ft.time_since_epoch().count());
+        std::string baseName = fs::path(bigPath).filename().string();
+        indexPath = (fs::path(outDir) / (std::string("index_") + baseName + "_" + std::to_string(mtimeTicks) + ".pldb")).string();
+    } catch (...) {
+        indexPath = (fs::path(outDir) / "index.pldb").string();
+    }
+    
+    if (!rebuildIndex && loadIndex(indexPath, db, 256)) {
         logmsg("[INFO] Загружен индекс: " + indexPath + ", записей=" + std::to_string(db.size()));
     } else {
         // Создаем новый индекс с аугментированными версиями
-        logmsg("[INFO] Создаем аугментированную базу данных...");
+        logmsg("[INFO] Создаем аугментированную базу данных для сверточного автоэнкодера...");
         
         // Каждый патч создает 8 версий: оригинал + 3 поворота + 4 HSV варианта
         size_t totalPatches = patches.size() * 8;
         db.reserve(totalPatches);
         
+        // Показываем прогресс каждые 1000 патчей
+        size_t progressStep = 1000;
+        size_t processed = 0;
+        
+        logmsg("[DEBUG] Начинаем обработку " + std::to_string(patches.size()) + " патчей...");
+        
         for (const auto& p : patches) {
             // Получаем аугментированные версии патча
-            auto augmented = enc.augmentPatch(p.image);
+            auto augmented = convAE.augmentPatch(p.image);
             
             for (size_t augIdx = 0; augIdx < augmented.size(); ++augIdx) {
                 IndexedDescriptor id;
                 id.topLeft = p.topLeft; // позиция остается та же
                 id.augmentationType = static_cast<int>(augIdx); // тип аугментации
                 
-                // Используем обученную модель, если доступна
-                id.descriptor = enc.encodeWithModel(augmented[augIdx]);
+                // Кодируем патч с помощью сверточного автоэнкодера
+                id.descriptor = convAE.encode(augmented[augIdx]);
                 db.push_back(std::move(id));
+                
+                processed++;
+                if (processed % progressStep == 0) {
+                    logmsg("[INFO] Обработано патчей: " + std::to_string(processed) + "/" + std::to_string(totalPatches));
+                }
             }
         }
         
@@ -249,54 +262,34 @@ int main(int argc, char** argv) {
         else logmsg("[WARN] Не удалось сохранить индекс: " + indexPath);
     }
 
-    // Обучение нейронной сети (если включено)
+    // Обучение сверточного автоэнкодера (если включено)
     if (trainMode) {
         if (modelPath.empty()) {
-            modelPath = (fs::path(outDir) / "autoencoder.model").string();
+            modelPath = (fs::path(outDir) / "convolutional_autoencoder.model").string();
         }
         
-        logmsg("[INFO] Начинаем обучение нейронной сети...");
+        logmsg("[INFO] Начинаем обучение сверточного автоэнкодера...");
         logmsg("[INFO] Эпохи: " + std::to_string(epochs));
         logmsg("[INFO] Скорость обучения: " + std::to_string(learningRate));
         logmsg("[INFO] Путь к модели: " + modelPath);
         
-        // Подготавливаем данные для обучения (берем первые 100 патчей для экономии времени)
+        // Подготавливаем данные для обучения (используем все патчи)
         std::vector<cv::Mat> trainPatches;
-        int maxTrain = std::min(100, static_cast<int>(patches.size()));
-        trainPatches.reserve(maxTrain);
-        for (int i = 0; i < maxTrain; ++i) {
+        trainPatches.reserve(patches.size());
+        for (size_t i = 0; i < patches.size(); ++i) {
             trainPatches.push_back(patches[i].image);
         }
         
         logmsg("[INFO] Патчей для обучения: " + std::to_string(trainPatches.size()));
         
         // Обучаем сеть
-        if (enc.train(trainPatches, epochs, learningRate, modelPath)) {
+        if (convAE.train(trainPatches, epochs, learningRate)) {
             logmsg("[INFO] Обучение завершено успешно!");
-            logmsg("[INFO] Модель сохранена: " + modelPath);
-            
-            // Тестируем обученную модель на нескольких патчах
-            logmsg("[INFO] Тестируем обученную модель...");
-            {
-                int testCount = 0;
-                double totalError = 0.0;
-                int maxTest = std::min(10, static_cast<int>(trainPatches.size()));
-                for (int i = 0; i < maxTest; ++i) {
-                    auto original = enc.encode(trainPatches[i]);
-                    auto reconstructed = enc.encodeWithModel(trainPatches[i]);
-                    double error = Localization::l2(original, reconstructed);
-                    totalError += error;
-                    testCount++;
-                    logmsg("[TEST] Патч " + std::to_string(i) + ", ошибка: " + std::to_string(error));
-                }
-                if (testCount > 0) {
-                    double avgError = totalError / testCount;
-                    logmsg("[INFO] Средняя ошибка реконструкции: " + std::to_string(avgError));
-                }
+            if (convAE.saveModel(modelPath)) {
+                logmsg("[INFO] Модель сохранена: " + modelPath);
             }
-            
         } else {
-            logmsg("[WARN] Обучение не удалось, используем базовые гистограммы");
+            logmsg("[WARN] Обучение не удалось");
         }
     }
 
@@ -305,8 +298,8 @@ int main(int argc, char** argv) {
         int bestIdx = -1; 
         double bestDist = std::numeric_limits<double>::infinity(); 
         
-        // Получаем дескриптор запроса
-        auto qdesc = enc.encodeWithModel(queryImg);
+        // Получаем дескриптор запроса с помощью сверточного автоэнкодера
+        auto qdesc = convAE.encode(queryImg);
         
         // Ищем ближайший в аугментированной базе данных
         int idx = Localization::findNearest(qdesc, db);
@@ -315,7 +308,7 @@ int main(int argc, char** argv) {
             bestDist = Localization::l2(qdesc, db[idx].descriptor);
         }
         
-        return std::tuple<int,double,int>(bestIdx, bestDist, 0); // поворот не нужен
+        return std::tuple<int,double,int>(bestIdx, bestDist, 0);
     };
 
     // Обрабатываем патч
@@ -332,7 +325,10 @@ int main(int argc, char** argv) {
         }
         
         // Ищем лучшее совпадение
-        auto [bestIdx, bestDist, bestRot] = solveOne(query);
+        auto result = solveOne(query);
+        int bestIdx = std::get<0>(result);
+        double bestDist = std::get<1>(result);
+        int bestRot = std::get<2>(result);
         if (bestIdx < 0) { 
             logmsg("[ERROR] Совпадение не найдено (пустая база данных)."); 
             return 4; 
@@ -387,8 +383,10 @@ int main(int argc, char** argv) {
         
         for (int i = 0; i < genPatchesN; ++i) {
             // Выбираем позицию на сетке с шагом 50
-            int x = 50 * (rng.uniform(0, std::max(1, width - patchSize)) / 50);
-            int y = 50 * (rng.uniform(0, std::max(1, height - patchSize)) / 50);
+            int maxX = (1 > width - patchSize) ? 1 : width - patchSize;
+            int maxY = (1 > height - patchSize) ? 1 : height - patchSize;
+            int x = 50 * (rng.uniform(0, maxX) / 50);
+            int y = 50 * (rng.uniform(0, maxY) / 50);
             cv::Rect roi(x, y, patchSize, patchSize);
             cv::Mat p = ip.image()(roi).clone();
             
@@ -441,7 +439,10 @@ int main(int argc, char** argv) {
                 cv::resize(q, q, cv::Size(patchSize, patchSize), 0, 0, cv::INTER_AREA);
             }
             
-            auto [bestIdx, bestDist, bestRot] = solveOne(q);
+            auto result = solveOne(q);
+            int bestIdx = std::get<0>(result);
+            double bestDist = std::get<1>(result);
+            int bestRot = std::get<2>(result);
             if (bestIdx < 0) { 
                 logmsg("[WARN] Совпадение не найдено для: " + patchFile); 
                 continue; 
@@ -452,7 +453,14 @@ int main(int argc, char** argv) {
                 logmsg("[WARN] Индекс вне диапазона при вычислении центра предсказания");
                 continue;
             }
-            cv::Point predCenter(patches[originalPatchIdx].topLeft.x + patchSize/2, patches[originalPatchIdx].topLeft.y + patchSize/2);
+            
+            // Получаем начальную позицию
+            cv::Point initialPos = patches[originalPatchIdx].topLeft;
+            
+            // Применяем постобработку для уточнения позиции
+            cv::Point refinedPos = Localization::refinePosition(ip.image(), q, initialPos, 25);
+            
+            cv::Point predCenter(refinedPos.x + patchSize/2, refinedPos.y + patchSize/2);
             double gx = 0.0, gy = 0.0; 
             try { 
                 gx = std::stod(xs); 
@@ -489,5 +497,3 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-
-

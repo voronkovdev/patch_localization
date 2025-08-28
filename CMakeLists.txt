@@ -15,28 +15,11 @@ else()
     message(FATAL_ERROR "OpenCV не найден! Установите OpenCV 4.x")
 endif()
 
-# Опция для TinyDNN
-option(USE_TINYDNN "Enable TinyDNN for neural network features" ON)
-
-if(USE_TINYDNN)
-    set(TINYDNN_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tiny-dnn-master")
-    if(EXISTS "${TINYDNN_INCLUDE_DIRS}/tiny_dnn/tiny_dnn.h")
-        message(STATUS "TinyDNN найден: ${TINYDNN_INCLUDE_DIRS}")
-        add_definitions(-DUSE_TINYDNN)
-    else()
-        message(WARNING "TinyDNN не найден, отключаем")
-        set(USE_TINYDNN OFF)
-    endif()
-else()
-    message(STATUS "TinyDNN отключен - используем только гистограммы")
-endif()
-
 # Создаем библиотеку core
 add_library(core STATIC
     src/image_processor.cpp
-    src/localization.cpp
     src/autoencoder.cpp
-    src/index_io.cpp
+    src/localization.cpp
 )
 
 target_include_directories(core
@@ -44,10 +27,6 @@ target_include_directories(core
         ${OpenCV_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-
-if(USE_TINYDNN)
-    target_include_directories(core PUBLIC ${TINYDNN_INCLUDE_DIRS})
-endif()
 
 target_link_libraries(core
     PUBLIC
@@ -67,12 +46,6 @@ target_link_libraries(patch_localization
 if (MSVC)
     target_compile_options(core PRIVATE /W3)
     target_compile_options(patch_localization PRIVATE /W3)
-    
-    # TinyDNN требует /bigobj из-за большого количества шаблонов
-    if(USE_TINYDNN)
-        target_compile_options(core PRIVATE /bigobj)
-        target_compile_options(patch_localization PRIVATE /bigobj)
-    endif()
 else()
     target_compile_options(core PRIVATE -Wall -Wextra)
     target_compile_options(patch_localization PRIVATE -Wall -Wextra)
